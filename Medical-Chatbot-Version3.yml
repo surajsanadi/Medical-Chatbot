@@ -92,17 +92,10 @@ stages:
     - script: |
         set -e
 
-        SONAR_VERSION="5.0.1.3006"
-
-        echo "=== Downloading sonar-scanner ==="
-        wget -q "https://binaries.sonarsource.com/Distribution/sonar-scanner-cli/sonar-scanner-cli-${SONAR_VERSION}-linux.zip" -O /tmp/sonar-scanner.zip
-        unzip -q /tmp/sonar-scanner.zip -d /tmp
-        export PATH="/tmp/sonar-scanner-${SONAR_VERSION}-linux/bin:$PATH"
-
         echo "=== Running sonar-scanner ==="
         sonar-scanner \
           -Dsonar.host.url="http://40.115.142.126:9000" \
-          -Dsonar.token="$(SONAR_TOKEN)" \
+          -Dsonar.login="$SONAR_TOKEN" \
           -Dsonar.projectKey="medical-chatbot" \
           -Dsonar.projectName="medical-chatbot" \
           -Dsonar.sources="$(Build.SourcesDirectory)" \
@@ -113,6 +106,7 @@ stages:
 
       displayName: SonarQube Scan
       env:
+        SONAR_TOKEN: $(SONAR_TOKEN)
         SONARQUBE_SCANNER_PARAMS: '{}'
         BUILD_SOURCEBRANCH: ''
         BUILD_SOURCEBRANCHNAME: ''
