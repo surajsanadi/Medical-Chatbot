@@ -61,7 +61,16 @@ stages:
       displayName: Cache pip dependencies
 
     # ---------------------------------------------------
-    # 🚨 CRITICAL FIX: Disable Sonar auto branch injection
+    # Debug - Verify sources directory
+    # ---------------------------------------------------
+    - script: |
+        echo "Sources dir: $(Build.SourcesDirectory)"
+        ls -la $(Build.SourcesDirectory)
+        cat $(Build.SourcesDirectory)/sonar-project.properties || echo "FILE NOT FOUND"
+      displayName: Debug - Check sources dir
+
+    # ---------------------------------------------------
+    # Disable Sonar auto branch injection
     # ---------------------------------------------------
     - script: |
         echo "##vso[task.setvariable variable=SONARQUBE_SCANNER_PARAMS]{}"
@@ -74,13 +83,20 @@ stages:
       inputs:
         SonarQube: 'ado-sonar'
         scannerMode: 'CLI'
-        configMode: 'file'
+        configMode: 'manual'
         cliProjectKey: 'medical-chatbot'
         cliProjectName: 'medical-chatbot'
-        cliSources: '.'
+        cliSources: '$(Build.SourcesDirectory)'
         extraProperties: |
+          sonar.projectBaseDir=$(Build.SourcesDirectory)
           sonar.exclusions=**/venv/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/data/**,**/models/**,**/static/**,**/templates/**
           sonar.python.coverage.reportPaths=coverage.xml
+          sonar.branch.name=
+          sonar.pullrequest.key=
+          sonar.pullrequest.branch=
+          sonar.pullrequest.base=
+      env:
+        SONARQUBE_SCANNER_PARAMS: '{}'
 
     # ---------------------------------------------------
     # Setup Python environment
@@ -112,6 +128,8 @@ stages:
     # SonarQube Analyze
     # ---------------------------------------------------
     - task: SonarQubeAnalyze@7
+      env:
+        SONARQUBE_SCANNER_PARAMS: '{}'
 
     # ---------------------------------------------------
     # SonarQube Publish
