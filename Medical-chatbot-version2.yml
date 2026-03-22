@@ -1,0 +1,268 @@
+trigger: none
+
+pool:
+  name: New-pool
+
+variables:
+  azureSubscription: 'chidu-arm'
+  resourceGroup: 'Chidu-RG'
+
+  acrName: 'medicalchatbotacrv2'
+  imageRepository: 'medical-chatbot'
+  containerAppName: 'medical-chatbot-container'
+
+  tag: '$(Build.BuildId)'
+
+
+stages:
+
+# ======================================================
+# BUILD + TEST + SONAR
+# ======================================================
+
+- stage: Build
+  displayName: Build and Analyze
+
+  jobs:
+  - job: BuildJob
+
+    steps:
+
+    - checkout: self
+
+    # ---------------------------------------------------
+    # Verify Python
+    # ---------------------------------------------------
+    - script: |
+        set -e
+        python3.11 --version
+        which python3.11
+      displayName: Verify Python
+
+
+    # ---------------------------------------------------
+    # Create pip cache directory
+    # ---------------------------------------------------
+    - script: |
+        mkdir -p $(HOME)/.cache/pip
+      displayName: Create pip cache directory
+
+
+    # ---------------------------------------------------
+    # Cache pip dependencies
+    # ---------------------------------------------------
+    - task: Cache@2
+      inputs:
+        key: 'pip | "$(Agent.OS)" | requirements.txt'
+        restoreKeys: |
+          pip | "$(Agent.OS)"
+        path: $(HOME)/.cache/pip
+      displayName: Cache pip dependencies
+
+
+    # ---------------------------------------------------
+    # SonarQube Prepare
+    # ---------------------------------------------------
+    - task: SonarQubePrepare@7
+      inputs:
+        SonarQube: 'ado-sonar'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'medical-chatbot'
+        cliProjectName: 'medical-chatbot'
+        cliSources: '.'
+        extraProperties: |
+         sonar.exclusions=**/venv/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/data/**,**/models/**,**/static/**,**/templates/**
+
+
+
+    # ---------------------------------------------------
+    # Setup Python environment
+    # ---------------------------------------------------
+    - script: |
+        set -euo pipefail
+
+        rm -rf venv
+
+        python3.11 -m venv venv
+        source venv/bin/activate
+
+        python -m pip install --upgrade pip
+        python -m pip install --cache-dir $(HOME)/.cache/pip -r requirements.txt
+
+        python -m nltk.downloader punkt punkt_tab
+      displayName: Setup Python Environment
+
+
+    # ---------------------------------------------------
+    # Unit Tests
+    # ---------------------------------------------------
+    - script: |
+        source venv/bin/activate
+        pip install pytest
+        pytest
+      displayName: Run Unit Tests
+
+
+    # ---------------------------------------------------
+    # SonarQube Analyze
+    # ---------------------------------------------------
+    - task: SonarQubeAnalyze@7
+
+
+    # ---------------------------------------------------
+    # SonarQube Publish
+    # ---------------------------------------------------
+    - task: SonarQubePublish@7
+      inputs:
+        pollingTimeoutSec: '300'
+
+
+# ======================================================
+# SECURITY SCAN
+# ======================================================
+
+- stage: SecurityScan
+  displayName: Security Scan
+  dependsOn: Build
+
+  jobs:
+  - job: TrivyScan
+    displayName: Run Trivy Security Scans
+
+    steps:
+
+    # Install Trivy
+    - script: |
+        sudo apt-get update
+        sudo apt-get install curl -y
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+      displayName: Install Trivy
+
+    # Scan Source Code (Filesystem)
+    - script: |
+        ./bin/trivy fs .
+      displayName: Scan Source Code
+
+
+
+# ======================================================
+# BUILD DOCKER IMAGE + PUSH TO ACR
+# ======================================================
+
+- stage: BuildDocker
+  displayName: Build and Push Docker Image
+  dependsOn: SecurityScan
+
+  jobs:
+  - job: DockerBuild
+
+    steps:
+
+    # ---------------------------------------------------
+    # Build Docker Image
+    # ---------------------------------------------------
+    - task: AzureCLI@2
+      displayName: Build Image
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          az acr login --name $(acrName)
+
+          docker build -t $(acrName).azurecr.io/$(imageRepository):$(tag) .
+
+
+    # ---------------------------------------------------
+    # Install Trivy
+    # ---------------------------------------------------
+    - script: |
+        sudo apt-get update
+        sudo apt-get install curl -y
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+      displayName: Install Trivy
+
+    # ---------------------------------------------------
+    # Scan Docker Image
+    # ---------------------------------------------------
+    - script: |
+        ./bin/trivy image --exit-code 0 --severity HIGH --scanners vuln --timeout 20m $(acrName).azurecr.io/$(imageRepository):$(tag)
+      displayName: Scan Docker Image
+
+    # ---------------------------------------------------
+    # Push Image to ACR
+    # ---------------------------------------------------
+    - task: AzureCLI@2
+      displayName: Push Image to ACR
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          az acr login --name $(acrName)
+
+          docker push $(acrName).azurecr.io/$(imageRepository):$(tag)
+
+
+
+# ======================================================
+# DEPLOY TO AZURE CONTAINER APPS
+# ======================================================
+
+- stage: Deploy
+  displayName: Deploy to Azure Container Apps
+  dependsOn: BuildDocker
+
+  jobs:
+  - job: DeployContainer
+
+    steps:
+
+    - task: AzureCLI@2
+      displayName: Deploy Container App
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          az containerapp update \
+            --name $(containerAppName) \
+            --resource-group $(resourceGroup) \
+            --image $(acrName).azurecr.io/$(imageRepository):$(tag)
+
+
+
+# ======================================================
+# HEALTH CHECK
+# ======================================================
+
+- stage: HealthCheck
+  displayName: Validate Deployment
+  dependsOn: Deploy
+
+  jobs:
+  - job: HealthCheckJob
+
+    steps:
+
+    - task: AzureCLI@2
+      displayName: Verify Health Endpoint
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          APP_URL=$(az containerapp show \
+            --name $(containerAppName) \
+            --resource-group $(resourceGroup) \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+
+          echo "Checking health..."
+
+          curl -f https://$APP_URL/health || exit 1

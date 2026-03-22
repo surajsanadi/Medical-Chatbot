@@ -1,0 +1,393 @@
+trigger: none
+
+pool:
+  name: New-pool
+
+variables:
+  azureSubscription: 'chidu-arm'
+  resourceGroup: 'Chidu-RG'
+
+  acrName: 'medicalchatbotacrv2'
+  imageRepository: 'medical-chatbot'
+  containerAppName: 'medical-chatbot-container'
+  containerAppNameGreen: 'medical-chatbot-container-green'
+  appGatewayName: 'medical-chatbot-agw'
+  appGatewayBackendPool: 'greenBackendPool'
+
+  tag: '$(Build.BuildId)'
+
+
+stages:
+
+# ======================================================
+# BUILD + TEST + SONAR
+# ======================================================
+
+- stage: Build
+  displayName: Build and Analyze
+
+  jobs:
+  - job: BuildJob
+
+    steps:
+
+    - checkout: self
+
+    # ---------------------------------------------------
+    # Verify Python
+    # ---------------------------------------------------
+    - script: |
+        set -e
+        python3.11 --version
+        which python3.11
+      displayName: Verify Python
+
+    # ---------------------------------------------------
+    # Create pip cache directory
+    # ---------------------------------------------------
+    - script: |
+        mkdir -p $(HOME)/.cache/pip
+      displayName: Create pip cache directory
+
+    # ---------------------------------------------------
+    # Cache pip dependencies
+    # ---------------------------------------------------
+    - task: Cache@2
+      inputs:
+        key: 'pip | "$(Agent.OS)" | requirements.txt'
+        restoreKeys: |
+          pip | "$(Agent.OS)"
+        path: $(HOME)/.cache/pip
+      displayName: Cache pip dependencies
+
+    # ---------------------------------------------------
+    # SonarQube Prepare
+    # ---------------------------------------------------
+    - task: SonarQubePrepare@7
+      inputs:
+        SonarQube: 'ado-sonar'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'medical-chatbot'
+        cliProjectName: 'medical-chatbot'
+        cliSources: '.'
+        extraProperties: |
+          sonar.exclusions=**/venv/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/data/**,**/models/**,**/static/**,**/templates/**
+
+    # ---------------------------------------------------
+    # Setup Python environment
+    # ---------------------------------------------------
+    - script: |
+        set -euo pipefail
+
+        rm -rf venv
+
+        python3.11 -m venv venv
+        source venv/bin/activate
+
+        python -m pip install --upgrade pip
+        python -m pip install --cache-dir $(HOME)/.cache/pip -r requirements.txt
+
+        python -m nltk.downloader punkt punkt_tab
+      displayName: Setup Python Environment
+
+    # ---------------------------------------------------
+    # Unit Tests
+    # ---------------------------------------------------
+    - script: |
+        source venv/bin/activate
+        pip install pytest
+        pytest
+      displayName: Run Unit Tests
+
+    # ---------------------------------------------------
+    # SonarQube Analyze
+    # ---------------------------------------------------
+    - task: SonarQubeAnalyze@7
+
+    # ---------------------------------------------------
+    # SonarQube Publish
+    # ---------------------------------------------------
+    - task: SonarQubePublish@7
+      inputs:
+        pollingTimeoutSec: '300'
+
+
+# ======================================================
+# SECURITY SCAN
+# ======================================================
+
+- stage: SecurityScan
+  displayName: Security Scan
+  dependsOn: Build
+
+  jobs:
+  - job: TrivyScan
+    displayName: Run Trivy Security Scans
+
+    steps:
+
+    # ---------------------------------------------------
+    # Install Trivy
+    # ---------------------------------------------------
+    - script: |
+        sudo apt-get update
+        sudo apt-get install curl -y
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+      displayName: Install Trivy
+
+    # ---------------------------------------------------
+    # Scan Source Code (Filesystem)
+    # ---------------------------------------------------
+    - script: |
+        ./bin/trivy fs .
+      displayName: Scan Source Code
+
+
+# ======================================================
+# BUILD DOCKER IMAGE + PUSH TO ACR
+# ======================================================
+
+- stage: BuildDocker
+  displayName: Build and Push Docker Image
+  dependsOn: SecurityScan
+
+  jobs:
+  - job: DockerBuild
+
+    steps:
+
+    # ---------------------------------------------------
+    # Build Docker Image
+    # ---------------------------------------------------
+    - task: AzureCLI@2
+      displayName: Build Image
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          az acr login --name $(acrName)
+
+          docker build -t $(acrName).azurecr.io/$(imageRepository):$(tag) .
+
+    # ---------------------------------------------------
+    # Install Trivy
+    # ---------------------------------------------------
+    - script: |
+        sudo apt-get update
+        sudo apt-get install curl -y
+        curl -sfL https://raw.githubusercontent.com/aquasecurity/trivy/main/contrib/install.sh | sh
+      displayName: Install Trivy
+
+    # ---------------------------------------------------
+    # Scan Docker Image
+    # ---------------------------------------------------
+    - script: |
+        ./bin/trivy image \
+          --exit-code 0 \
+          --severity HIGH \
+          --scanners vuln \
+          --timeout 20m \
+          $(acrName).azurecr.io/$(imageRepository):$(tag)
+      displayName: Scan Docker Image
+
+    # ---------------------------------------------------
+    # Push Image to ACR
+    # ---------------------------------------------------
+    - task: AzureCLI@2
+      displayName: Push Image to ACR
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          az acr login --name $(acrName)
+
+          docker push $(acrName).azurecr.io/$(imageRepository):$(tag)
+
+
+# ======================================================
+# DEPLOY TO GREEN SLOT (BLUE/GREEN)
+# ======================================================
+
+- stage: Deploy
+  displayName: Deploy to Green Slot
+  dependsOn: BuildDocker
+
+  jobs:
+  - job: DeployGreen
+
+    steps:
+
+    # ---------------------------------------------------
+    # Deploy new image to green container app
+    # ---------------------------------------------------
+    - task: AzureCLI@2
+      displayName: Deploy to Green Slot
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          az containerapp update \
+            --name $(containerAppNameGreen) \
+            --resource-group $(resourceGroup) \
+            --image $(acrName).azurecr.io/$(imageRepository):$(tag)
+
+          echo "=== Deployed new image to green slot ==="
+
+
+# ======================================================
+# HEALTH CHECK — GREEN SLOT
+# ======================================================
+
+- stage: HealthCheck
+  displayName: Validate Green Slot
+  dependsOn: Deploy
+
+  jobs:
+  - job: HealthCheckJob
+
+    steps:
+
+    # ---------------------------------------------------
+    # Verify green slot is healthy before traffic switch
+    # ---------------------------------------------------
+    - task: AzureCLI@2
+      displayName: Verify Green Health Endpoint
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          GREEN_URL=$(az containerapp show \
+            --name $(containerAppNameGreen) \
+            --resource-group $(resourceGroup) \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+
+          echo "=== Checking green slot health at: https://$GREEN_URL/health ==="
+
+          for i in {1..5}; do
+            echo "Attempt $i..."
+            curl -f https://$GREEN_URL/health && echo "=== Green slot is healthy ===" && exit 0
+            sleep 10
+          done
+
+          echo "=== Green slot health check failed after 5 attempts ==="
+          exit 1
+
+
+# ======================================================
+# SWITCH TRAFFIC — APPLICATION GATEWAY → GREEN
+# ======================================================
+
+- stage: SwitchTraffic
+  displayName: Switch Traffic to Green
+  dependsOn: HealthCheck
+
+  jobs:
+  - job: TrafficSwitch
+
+    steps:
+
+    # ---------------------------------------------------
+    # Step 1: Point Application Gateway to GREEN slot
+    # ---------------------------------------------------
+    - task: AzureCLI@2
+      displayName: Switch Traffic to Green
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          GREEN_FQDN=$(az containerapp show \
+            --name $(containerAppNameGreen) \
+            --resource-group $(resourceGroup) \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+
+          az network application-gateway address-pool update \
+            --gateway-name $(appGatewayName) \
+            --resource-group $(resourceGroup) \
+            --name $(appGatewayBackendPool) \
+            --servers $GREEN_FQDN
+
+          echo "=== Traffic switched to green slot: $GREEN_FQDN ==="
+
+    # ---------------------------------------------------
+    # Step 2: Update BLUE container with new image
+    # ---------------------------------------------------
+    - task: AzureCLI@2
+      displayName: Promote Green to Blue
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          az containerapp update \
+            --name $(containerAppName) \
+            --resource-group $(resourceGroup) \
+            --image $(acrName).azurecr.io/$(imageRepository):$(tag)
+
+          echo "=== Blue slot updated with new image ==="
+
+    # ---------------------------------------------------
+    # Step 3: Wait for BLUE slot to be ready       ← NEW
+    # ---------------------------------------------------
+    - task: AzureCLI@2
+      displayName: Wait for Blue Slot to be Ready
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          echo "=== Waiting for blue slot to be ready ==="
+
+          BLUE_URL=$(az containerapp show \
+            --name $(containerAppName) \
+            --resource-group $(resourceGroup) \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+
+          for i in {1..10}; do
+            echo "Attempt $i — checking blue slot health..."
+            curl -f https://$BLUE_URL/health && echo "=== Blue slot is healthy ===" && break
+            sleep 15
+          done
+
+          echo "=== Blue slot FQDN: $BLUE_URL ==="
+
+    # ---------------------------------------------------
+    # Step 4: Switch Application Gateway back to BLUE  ← NEW
+    # ---------------------------------------------------
+    - task: AzureCLI@2
+      displayName: Switch Traffic Back to Blue
+      inputs:
+        azureSubscription: $(azureSubscription)
+        scriptType: bash
+        scriptLocation: inlineScript
+        inlineScript: |
+
+          BLUE_FQDN=$(az containerapp show \
+            --name $(containerAppName) \
+            --resource-group $(resourceGroup) \
+            --query properties.configuration.ingress.fqdn \
+            --output tsv)
+
+          az network application-gateway address-pool update \
+            --gateway-name $(appGatewayName) \
+            --resource-group $(resourceGroup) \
+            --name $(appGatewayBackendPool) \
+            --servers $BLUE_FQDN
+
+          echo "=== Traffic switched back to blue slot: $BLUE_FQDN ==="
+          echo "=== Blue/Green deployment complete ==="

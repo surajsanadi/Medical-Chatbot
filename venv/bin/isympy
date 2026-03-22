@@ -1,0 +1,6 @@
+#!/Users/chidu/Desktop/Github_repos/Python-Projects/Medical_Chatbot/venv/bin/python3.11
+import sys
+from isympy import main
+if __name__ == '__main__':
+    sys.argv[0] = sys.argv[0].removesuffix('.exe')
+    sys.exit(main())

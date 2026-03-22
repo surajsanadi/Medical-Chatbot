@@ -1,0 +1,173 @@
+trigger: none
+
+pool:
+  name: New-pool
+
+variables:
+  azureSubscription: 'chidu-arm'
+  appName: 'medical-chatbot-prod'
+  resourceGroup: 'Chidu-RG'
+
+stages:
+
+# ======================================================
+# BUILD STAGE
+# ======================================================
+
+- stage: Build
+  displayName: Build and Analyze
+
+  jobs:
+  - job: BuildJob
+    displayName: Build Job
+
+    steps:
+
+    # ---------------------------------------------------
+    # Verify Python on self-hosted agent
+    # ---------------------------------------------------
+    - script: |
+        set -e
+        echo "Checking Python installation..."
+        python3.11 --version
+        which python3.11
+      displayName: Verify Python
+
+
+    # ---------------------------------------------------
+    # Create pip cache directory
+    # ---------------------------------------------------
+    - script: |
+        mkdir -p $(HOME)/.cache/pip
+      displayName: Create pip cache directory
+
+
+    # ---------------------------------------------------
+    # Cache pip dependencies
+    # ---------------------------------------------------
+    - task: Cache@2
+      inputs:
+        key: 'pip | "$(Agent.OS)" | requirements.txt'
+        restoreKeys: |
+          pip | "$(Agent.OS)"
+        path: $(HOME)/.cache/pip
+      displayName: Cache pip dependencies
+
+
+    # ---------------------------------------------------
+    # SonarQube Prepare
+    # ---------------------------------------------------
+    - task: SonarQubePrepare@7
+      inputs:
+        SonarQube: 'ado-sonar'
+        scannerMode: 'CLI'
+        configMode: 'manual'
+        cliProjectKey: 'medical-chatbot'
+        cliProjectName: 'medical-chatbot'
+        cliSources: '.'
+        extraProperties: |
+          sonar.exclusions=**/venv/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/data/**,**/models/**,**/static/**,**/templates/**
+
+
+    # ---------------------------------------------------
+    # Setup Python environment
+    # ---------------------------------------------------
+    - script: |
+        set -euo pipefail
+
+        echo "Cleaning previous virtual environment..."
+        rm -rf venv
+
+        echo "Creating virtual environment..."
+        python3.11 -m venv venv
+
+        source venv/bin/activate
+
+        echo "Python inside venv:"
+        python --version
+
+        echo "Upgrading pip..."
+        python -m pip install --upgrade pip
+
+        echo "Installing dependencies using cache..."
+        python -m pip install --cache-dir $(HOME)/.cache/pip -r requirements.txt
+
+        echo "Downloading NLTK models..."
+        python -m nltk.downloader punkt punkt_tab
+
+      displayName: Setup Python Environment
+
+
+    # ---------------------------------------------------
+    # SonarQube Analyze
+    # ---------------------------------------------------
+    - task: SonarQubeAnalyze@7
+      env:
+        SONAR_SCANNER_OPTS: "-Xmx2g"
+
+
+    # ---------------------------------------------------
+    # SonarQube Publish
+    # ---------------------------------------------------
+    - task: SonarQubePublish@7
+      inputs:
+        pollingTimeoutSec: '300'
+
+
+    # ---------------------------------------------------
+    # Cleanup before packaging
+    # ---------------------------------------------------
+    - script: |
+        set -e
+        echo "Cleaning unnecessary files..."
+        rm -rf venv
+        rm -rf .git
+        rm -rf __pycache__
+      displayName: Cleanup build artifacts
+
+
+    # ---------------------------------------------------
+    # Archive application
+    # ---------------------------------------------------
+    - task: ArchiveFiles@2
+      inputs:
+        rootFolderOrFile: $(System.DefaultWorkingDirectory)
+        includeRootFolder: false
+        archiveType: zip
+        archiveFile: $(Build.ArtifactStagingDirectory)/app.zip
+        replaceExistingArchive: true
+
+
+    # ---------------------------------------------------
+    # Publish artifact
+    # ---------------------------------------------------
+    - publish: $(Build.ArtifactStagingDirectory)/app.zip
+      artifact: drop
+
+
+
+# ======================================================
+# DEPLOY STAGE
+# ======================================================
+
+- stage: Deploy
+  displayName: Deploy to Azure App Service
+  dependsOn: Build
+
+  jobs:
+  - deployment: DeployWebApp
+    environment: production
+
+    strategy:
+      runOnce:
+        deploy:
+          steps:
+
+          - download: current
+            artifact: drop
+
+          - task: AzureWebApp@1
+            inputs:
+              azureSubscription: $(azureSubscription)
+              appName: $(appName)
+              package: $(Pipeline.Workspace)/drop/app.zip
