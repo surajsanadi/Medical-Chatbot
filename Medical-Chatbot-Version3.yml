@@ -73,6 +73,7 @@ stages:
         cliSources: '.'
         extraProperties: |
           sonar.exclusions=**/venv/**,**/.git/**,**/__pycache__/**,**/*.pyc,**/data/**,**/models/**,**/static/**,**/templates/**
+          sonar.branch.name=
 
     # ---------------------------------------------------
     # Setup Python environment
