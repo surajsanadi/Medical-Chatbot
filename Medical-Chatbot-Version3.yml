@@ -74,7 +74,7 @@ stages:
       inputs:
         SonarQube: 'ado-sonar'
         scannerMode: 'CLI'
-        configMode: 'manual'
+        configMode: 'file'
         cliProjectKey: 'medical-chatbot'
         cliProjectName: 'medical-chatbot'
         cliSources: '.'
